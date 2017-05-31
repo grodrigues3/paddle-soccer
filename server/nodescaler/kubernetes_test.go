@@ -15,9 +15,9 @@
 package nodescaler
 
 import (
-	"testing"
-
 	"log"
+	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -38,7 +38,7 @@ func TestListNodePods(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "pod2", Namespace: "default"}}}}
 
-	s, err := NewServer("", "app=game-server", "0.5", 5)
+	s, err := NewServer("", "app=game-server", "0.5", 5, time.Second)
 	assert.Nil(t, err)
 	sc := fake.NewSimpleClientset(fixture)
 	s.cs = sc
@@ -94,7 +94,7 @@ func TestNewNodeList(t *testing.T) {
 						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1.2")}}}}}}}}
 
 	cs := &fake.Clientset{}
-	s, err := NewServer("", "app=game-server", "0.5", 5)
+	s, err := NewServer("", "app=game-server", "0.5", 5, time.Second)
 	assert.Nil(t, err)
 	s.cs = cs
 
@@ -150,7 +150,11 @@ func TestAvailableNodes(t *testing.T) {
 				Conditions: readyNodeCondition}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "goat", Labels: map[string]string{"app": "game-server"}},
 			Status: v1.NodeStatus{Capacity: v1.ResourceList{v1.ResourceCPU: resource.MustParse("3.0")},
-				Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionFalse}}}}}}
+				Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionFalse}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "unscheduled", Labels: map[string]string{"app": "game-server"}},
+			Spec: v1.NodeSpec{Unschedulable: true},
+			Status: v1.NodeStatus{Capacity: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2.0")},
+				Conditions: readyNodeCondition}}}}
 
 	nl := nodeList{nodes: nodes}
 	expected := []v1.Node{nodes.Items[0], nodes.Items[1]}
@@ -189,7 +193,7 @@ func TestCpuRequestsAvailable(t *testing.T) {
 						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1.8")}}}}}}}}
 
 	cs := &fake.Clientset{}
-	s, err := NewServer("", "app=game-server", "0.5", 5)
+	s, err := NewServer("", "app=game-server", "0.5", 5, time.Second)
 	assert.Nil(t, err)
 	s.cs = cs
 
@@ -227,21 +231,71 @@ func TestNewGameWatcher(t *testing.T) {
 	t.Parallel()
 
 	mw := watch.NewFake()
-	gw := &gameWatcher{event: make(chan bool), watcher: mw}
+	gw := &gameWatcher{events: make(chan bool), watcher: mw}
 	gw.start()
 	go func() {
 		defer gw.stop()
 		mw.Action(watch.Added, nil)
+		mw.Action(watch.Deleted, nil)
 		mw.Action(watch.Error, nil)
 		mw.Action(watch.Modified, nil)
 		mw.Action(watch.Deleted, nil)
 	}()
 
-	eventCount := 0
-
-	for range gw.event {
-		eventCount++
+	i := 0
+	for range gw.events {
+		i++
 	}
+	assert.Equal(t, 3, i)
+}
 
-	assert.Equal(t, 1, eventCount)
+func TestCordon(t *testing.T) {
+	t.Parallel()
+
+	nodes := &v1.NodeList{Items: []v1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "foo",
+		Labels:      map[string]string{"app": "game-server"},
+		Annotations: map[string]string{}}, Spec: v1.NodeSpec{Unschedulable: false},
+		Status: v1.NodeStatus{Capacity: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2.0")},
+			Conditions: readyNodeCondition}},
+	}}
+	cs := &fake.Clientset{}
+	s, err := NewServer("", "app=game-server", "0.5", 5, time.Second)
+	assert.Nil(t, err)
+	s.cs = cs
+	cs.AddReactor("list", "nodes", func(a core.Action) (bool, runtime.Object, error) {
+		return true, nodes, nil
+	})
+	cs.AddReactor("update", "nodes", func(a core.Action) (bool, runtime.Object, error) {
+		ua := a.(core.UpdateAction)
+		n := ua.GetObject().(*v1.Node)
+		nodes.Items[0] = *n
+		return true, n, nil
+	})
+
+	now := time.Now().UTC()
+	node := nodes.Items[0]
+	err = s.cordon(&node, true)
+	assert.Nil(t, err)
+	assert.True(t, node.Spec.Unschedulable)
+	var ts time.Time
+	err = ts.UnmarshalText([]byte(node.ObjectMeta.Annotations[timestampAnnotation]))
+	assert.Nil(t, err)
+	assert.True(t, ts.Equal(now) || ts.After(now), "Now: %v is not equal to or after %v", now, ts)
+
+	nl, err := s.newNodeList()
+	assert.Nil(t, err)
+	assert.True(t, nl.nodes.Items[0].Spec.Unschedulable)
+	assert.Equal(t, 0, len(nl.availableNodes()))
+
+	err = s.cordon(&node, false)
+	assert.Nil(t, err)
+	assert.False(t, node.Spec.Unschedulable)
+	err = ts.UnmarshalText([]byte(node.ObjectMeta.Annotations[timestampAnnotation]))
+	assert.Nil(t, err)
+	assert.True(t, ts.Equal(now) || ts.After(now), "Now: %v is not equal to or after %v", now, ts)
+
+	nl, err = s.newNodeList()
+	assert.Nil(t, err)
+	assert.False(t, nl.nodes.Items[0].Spec.Unschedulable)
+	assert.Equal(t, 1, len(nl.availableNodes()))
 }

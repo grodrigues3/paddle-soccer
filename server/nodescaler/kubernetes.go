@@ -15,12 +15,23 @@
 package nodescaler
 
 import (
+	"sync"
+	"time"
+
+	"log"
+
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/pkg/api"
 	"k8s.io/client-go/pkg/api/v1"
+)
+
+const (
+	// Attribute key for where to put the timestamp when
+	// making changes to a node
+	timestampAnnotation = "nodescale/timestamp"
 )
 
 // nodeList is the set of current nodes that this
@@ -57,13 +68,13 @@ func (nl nodeList) nodePods(n v1.Node) *v1.PodList {
 	return nl.pods[n.Name]
 }
 
-// returns nodes that are available to be used.
-// This could mean they are ready, or (TBD)
-// that they are available to be scheduled.
+// availableNodes returns nodes that are available to be used.
+// This could mean they are ready
+// that they are scheduled.
 func (nl nodeList) availableNodes() []v1.Node {
 	result := []v1.Node{}
 	for _, n := range nl.nodes.Items {
-		if nodeReady(n) {
+		if nodeReady(n) && !n.Spec.Unschedulable {
 			result = append(result, n)
 		}
 	}
@@ -71,18 +82,21 @@ func (nl nodeList) availableNodes() []v1.Node {
 	return result
 }
 
-// implements Kubernetes watch.Interface to allow for
+// gameWatcher implements Kubernetes watch.Interface to allow for
 // scaling up to be processed whenever a game event occurs
-// Adds a value to the event channel whenever a game is
-// added to the nodepool in question
+// Adds a value to the events channel whenever a game is
+// added to the nodepool in question, or deleted
 type gameWatcher struct {
 	watcher watch.Interface
-	event   chan bool
+	events  chan bool
+	// Wait Group to ensure that closing of channels on stop
+	// doesn't interrupt a currently processing event.
+	wg sync.WaitGroup
 }
 
 // newGameWatcher returns a new game watcher
 func (s *Server) newGameWatcher() (*gameWatcher, error) {
-	g := &gameWatcher{event: make(chan bool)}
+	g := &gameWatcher{events: make(chan bool)}
 
 	watcher, err := s.cs.CoreV1().Pods(api.NamespaceAll).Watch(metav1.ListOptions{LabelSelector: "sessions=game"})
 	if err != nil {
@@ -96,18 +110,24 @@ func (s *Server) newGameWatcher() (*gameWatcher, error) {
 // start starts the game watcher, watching the K8 event stream
 func (g *gameWatcher) start() {
 	go func() {
+		// WaitGroup for ensuring that if we are shutting down
+		// we don't shut down the events/deleted channels
+		// before ResultChan's events are fully processed.
+		g.wg.Add(1)
 		for e := range g.watcher.ResultChan() {
-			if e.Type == watch.Added {
-				g.event <- true
+			if e.Type == watch.Added || e.Type == watch.Deleted {
+				g.events <- true
 			}
 		}
+		g.wg.Done()
 	}()
 }
 
 // stop closes all the channels, when you are done
 func (g *gameWatcher) stop() {
 	g.watcher.Stop()
-	close(g.event)
+	g.wg.Wait()
+	close(g.events)
 }
 
 // cpuRequestsAvailable looks at each node's cpu capacity,
@@ -163,4 +183,22 @@ func sumCPUResourceRequests(pl *v1.PodList) int64 {
 	}
 
 	return total
+}
+
+// cordon sets or unsets a node to being unschedulable
+// a 'true' parameter will set a node to being unschedulable (cordoned)
+// this also sets a timestamp annotation on the node, to track when this was
+// last done.
+func (s *Server) cordon(n *v1.Node, unscheduled bool) error {
+	now, err := time.Now().UTC().MarshalText()
+	if err != nil {
+		return errors.Wrap(err, "Could not marshall now datetime as string")
+	}
+
+	n.Spec.Unschedulable = unscheduled
+	n.ObjectMeta.Annotations[timestampAnnotation] = string(now)
+	h, err := s.cs.CoreV1().Nodes().Update(n)
+	log.Printf("[Debug][Cordon] Name: %v, Returned Node Spec: %#v. Should be: %v", n.Name, h.Spec, unscheduled)
+
+	return errors.Wrapf(err, "Error Updating Node %#v", n)
 }
