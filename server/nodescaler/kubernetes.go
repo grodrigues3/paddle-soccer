@@ -15,10 +15,9 @@
 package nodescaler
 
 import (
+	"log"
 	"sync"
 	"time"
-
-	"log"
 
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,8 +37,9 @@ const (
 // server manages, with the accompanying pods for
 // each node
 type nodeList struct {
-	nodes *v1.NodeList
-	pods  map[string]*v1.PodList
+	nodes      *v1.NodeList
+	pods       map[string]*v1.PodList
+	cpuRequest int64
 }
 
 // newNodeList queries kubernetes to get a list of nodes
@@ -52,7 +52,7 @@ func (s *Server) newNodeList() (*nodeList, error) {
 		return result, errors.Wrap(err, "Could not get node list from Kubernetes")
 	}
 
-	result = &nodeList{nodes: nodes, pods: map[string]*v1.PodList{}}
+	result = &nodeList{nodes: nodes, pods: map[string]*v1.PodList{}, cpuRequest: s.cpuRequest}
 	for _, n := range nodes.Items {
 		pods, err := s.listNodePods(n)
 		if err != nil {
@@ -60,6 +60,7 @@ func (s *Server) newNodeList() (*nodeList, error) {
 		}
 		result.pods[n.Name] = pods
 	}
+
 	return result, err
 }
 
@@ -80,6 +81,26 @@ func (nl nodeList) availableNodes() []v1.Node {
 	}
 
 	return result
+}
+
+// cpuRequestsAvailable looks at each node's cpu capacity,
+// the current available free space in it, and determines
+// how many cpu requests are can be be fit in the
+// remaining space on each node
+func (nl *nodeList) cpuRequestsAvailable() int64 {
+	var avail int64
+	for _, n := range nl.availableNodes() {
+		capacity := n.Status.Capacity[v1.ResourceCPU]
+		requests := sumCPUResourceRequests(nl.nodePods(n))
+		diff := capacity.MilliValue() - requests
+
+		// take advantage of the fact we are using
+		// int64's and remainders / fractions are
+		// totally not what we want
+		avail += diff / nl.cpuRequest
+	}
+
+	return avail
 }
 
 // gameWatcher implements Kubernetes watch.Interface to allow for
@@ -128,26 +149,6 @@ func (g *gameWatcher) stop() {
 	g.watcher.Stop()
 	g.wg.Wait()
 	close(g.events)
-}
-
-// cpuRequestsAvailable looks at each node's cpu capacity,
-// the current available free space in it, and determines
-// how many cpu requests are can be be fit in the
-// remaining space on each node
-func (s *Server) cpuRequestsAvailable(nl *nodeList) int64 {
-	var avail int64
-	for _, n := range nl.availableNodes() {
-		capacity := n.Status.Capacity[v1.ResourceCPU]
-		requests := sumCPUResourceRequests(nl.nodePods(n))
-		diff := capacity.MilliValue() - requests
-
-		// take advantage of the fact we are using
-		// int64's and remainders / fractions are
-		// totally not what we want
-		avail += diff / s.cpuRequest
-	}
-
-	return avail
 }
 
 // nodeReady check if a node's kublet is ready to work

@@ -204,7 +204,7 @@ func TestCpuRequestsAvailable(t *testing.T) {
 
 	nl, err := s.newNodeList()
 	assert.Nil(t, err)
-	count := s.cpuRequestsAvailable(nl)
+	count := nl.cpuRequestsAvailable()
 	assert.Equal(t, int64(8), count)
 
 	cs.AddReactor("list", "pods", func(a core.Action) (bool, runtime.Object, error) {
@@ -223,7 +223,7 @@ func TestCpuRequestsAvailable(t *testing.T) {
 	nl, err = s.newNodeList()
 	assert.Nil(t, err)
 
-	count = s.cpuRequestsAvailable(nl)
+	count = nl.cpuRequestsAvailable()
 	assert.Equal(t, int64(2), count)
 }
 
